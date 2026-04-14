@@ -25,7 +25,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
   final TextEditingController _valueController = TextEditingController();
   final FocusNode _valueFocus = FocusNode();
 
-  // 🔥 DEFINED STREAK MILESTONES & REWARDS
   final Map<int, int> _milestones = {
     3: 50,
     7: 100,
@@ -46,6 +45,52 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
       _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         setState(() {});
       });
+    }
+  }
+
+  // ==========================================
+  // 🔥 Optimistic Wallet Adjuster
+  // ==========================================
+  Future<void> _adjustCurrency(int xpDelta) async {
+    if (xpDelta == 0) return;
+    
+    final supabase = Supabase.instance.client;
+    final userId = supabase.auth.currentUser?.id;
+    if (userId == null) return;
+
+    try {
+      final currencyData = await supabase
+          .from('currencies')
+          .select('clockcoins, loose_xp')
+          .eq('user_id', userId)
+          .maybeSingle();
+
+      int currentCoins = currencyData?['clockcoins'] as int? ?? 0;
+      int currentLoose = currencyData?['loose_xp'] as int? ?? 0;
+
+      int currentNetWorth = (currentCoins * 1000) + currentLoose;
+      int newNetWorth = max(0, currentNetWorth + xpDelta); 
+
+      int newCoins = newNetWorth ~/ 1000;
+      int newLoose = newNetWorth % 1000;
+
+      await supabase
+          .from('currencies')
+          .update({
+            'clockcoins': newCoins,
+            'loose_xp': newLoose,
+            'last_updated': DateTime.now().toUtc().toIso8601String(),
+          })
+          .eq('user_id', userId);
+          
+      // 🔥 THE FIX: Instantly update Hive for Optimistic UI Response
+      final settingsBox = Hive.box('settings');
+      settingsBox.put('clockcoins', newCoins);
+      settingsBox.put('loose_xp', newLoose);
+
+      debugPrint("💸 Economy Adjusted: $xpDelta XP. New Balance: $newCoins Coins, $newLoose Loose XP.");
+    } catch (e) {
+      debugPrint("❌ Failed to adjust currency: $e");
     }
   }
 
@@ -72,7 +117,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     return DateTime.now().difference(widget.habit.startTime!).inSeconds;
   }
 
-  // 🔥 NEW: Calculates XP based on percentage completed, ignoring corrupted data
   int _calculateSafeBaseXp(double value) {
     double currentPool = widget.habit.xpPerUnit * widget.habit.dailyTarget;
     double actualPool = 100.0;
@@ -139,6 +183,8 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     );
     await Hive.box<Sessions>('sessions').add(session);
 
+    await _adjustCurrency(totalXpEarned);
+
     if (bonusXp > 0) {
       _showMilestoneCelebration(widget.habit.streak, bonusXp);
     } else {
@@ -152,7 +198,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
   void _saveCountQuantity() async {
     FocusScope.of(context).unfocus();
     
-    // 🔥 THE FIX: Clamp the actual input value so it cannot exceed 99,999 per session
     double value = _currentValue.clamp(0.0, 99999.0);
     if (value <= 0) return;
 
@@ -167,6 +212,8 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
       xpEarned: totalXpEarned,
     );
     await Hive.box<Sessions>('sessions').add(session);
+
+    await _adjustCurrency(totalXpEarned);
 
     setState(() {
       _currentValue = 0;
@@ -185,42 +232,92 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
   Future<int> _updateLocalHabitProgress(int baseXp) async {
     final habit = widget.habit;
     final today = DateTime.now();
-    final yesterday = today.subtract(const Duration(days: 1));
+    final midnightToday = DateTime(today.year, today.month, today.day);
 
-    int totalCoinsBefore = habit.totalXP ~/ 1000;
-    bool missedDay = false;
     bool streakIncreased = false;
 
     if (habit.lastCompletedDate != null) {
       final last = habit.lastCompletedDate!;
-      if (_isSameDay(last, today)) {
+      final midnightLast = DateTime(last.year, last.month, last.day);
+      final difference = midnightToday.difference(midnightLast).inDays;
+
+      if (difference == 0) {
         // Already counted today
-      } else if (_isSameDay(last, yesterday)) {
+      } else if (difference == 1) {
         habit.streak += 1;
         streakIncreased = true;
       } else {
-        missedDay = true;
+        int missedDays = difference - 1; 
+
+        final supabase = Supabase.instance.client;
+        final userId = supabase.auth.currentUser?.id;
+        int userCoins = 0;
+
+        if (userId != null) {
+          try {
+            final currencyData = await supabase
+                .from('currencies')
+                .select('clockcoins')
+                .eq('user_id', userId)
+                .maybeSingle();
+            userCoins = currencyData?['clockcoins'] as int? ?? 0;
+          } catch (e) {
+            debugPrint("Failed to fetch ClockCoins: $e");
+          }
+        }
+
+        if (userCoins >= missedDays) {
+          bool? useCoin = await _showInsuranceDialog(missedDays, userCoins);
+          if (useCoin == true) {
+            if (userId != null) {
+              await supabase
+                  .from('currencies')
+                  .update({
+                    'clockcoins': userCoins - missedDays,
+                    'last_updated': DateTime.now().toUtc().toIso8601String(),
+                  })
+                  .eq('user_id', userId);
+            }
+            
+            // 🔥 THE FIX: Tell local Hive immediately that coins were spent
+            final settingsBox = Hive.box('settings');
+            int currentSpent = settingsBox.get('spent_coins', defaultValue: 0);
+            settingsBox.put('spent_coins', currentSpent + missedDays);
+            settingsBox.put('clockcoins', userCoins - missedDays);
+            
+            habit.streak += 1; 
+            streakIncreased = true;
+
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text("Streak saved! Deducted $missedDays ClockCoins.", style: const TextStyle(fontWeight: FontWeight.bold)),
+                  backgroundColor: Colors.green.shade700,
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            }
+          } else {
+            habit.streak = 1;
+            streakIncreased = true;
+          }
+        } else {
+          habit.streak = 1;
+          streakIncreased = true;
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text("Streak lost. You needed $missedDays ClockCoins, but only had $userCoins.", style: const TextStyle(fontWeight: FontWeight.bold)),
+                backgroundColor: Colors.red.shade700,
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+        }
       }
     } else {
       habit.streak = 1;
       streakIncreased = true;
-    }
-
-    if (missedDay) {
-      if (totalCoinsBefore >= 1) {
-        bool? useCoin = await _showInsuranceDialog();
-        if (useCoin == true) {
-          habit.totalXP -= 100;
-          habit.streak += 1;
-          streakIncreased = true;
-        } else {
-          habit.streak = 1;
-          streakIncreased = true;
-        }
-      } else {
-        habit.streak = 1;
-        streakIncreased = true;
-      }
     }
 
     int earnedBonus = 0;
@@ -229,23 +326,21 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     }
 
     habit.lastCompletedDate = today;
-    habit.totalXP += (baseXp + earnedBonus);
+    habit.totalXP += (baseXp + earnedBonus); 
     await habit.save();
 
     return earnedBonus;
   }
 
-  // 🔥 NEW: Session Deletion & Undo Function
   Future<void> _deleteSessionLog(dynamic sessionKey, Sessions session) async {
-    // 1. Deduct XP from Habit (Preventing negative XP)
     widget.habit.totalXP = max(0, widget.habit.totalXP - session.xpEarned);
     await widget.habit.save();
 
-    // 2. Delete local session record
     await Hive.box<Sessions>('sessions').delete(sessionKey);
-    setState(() {}); // Refresh UI
+    setState(() {}); 
 
-    // 3. Inform user
+    await _adjustCurrency(-session.xpEarned);
+
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -256,7 +351,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
       );
     }
 
-    // 4. Delete from Supabase in background
     try {
       final supabase = Supabase.instance.client;
       await supabase
@@ -269,7 +363,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     }
   }
 
-  // 🔥 NEW: Edit an existing session log and safely recalculate XP
   Future<void> _editSessionLog(dynamic sessionKey, Sessions session) async {
     final editCtrl = TextEditingController(
       text: session.value.toStringAsFixed(session.value.truncateToDouble() == session.value ? 0 : 1)
@@ -321,28 +414,29 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
       double newValue = double.tryParse(editCtrl.text) ?? session.value;
       newValue = newValue.clamp(0.0, 99999.0);
 
-      if (newValue == session.value) return; // No change
+      if (newValue == session.value) return; 
       if (newValue <= 0) {
-        _deleteSessionLog(sessionKey, session); // If they edit to 0, just delete it
+        _deleteSessionLog(sessionKey, session); 
         return;
       }
 
-      // Calculate the difference in Base XP, preserving any streak bonus they earned that day
       int oldBaseXp = _calculateSafeBaseXp(session.value);
       int newBaseXp = _calculateSafeBaseXp(newValue);
       int bonusXp = session.xpEarned - oldBaseXp; 
       int newTotalXpEarned = newBaseXp + bonusXp;
 
-      // Safely update Habit Total XP
+      int xpDifference = newTotalXpEarned - session.xpEarned;
+
       widget.habit.totalXP = max(0, widget.habit.totalXP - session.xpEarned + newTotalXpEarned);
       await widget.habit.save();
 
-      // Update Session
       session.value = newValue;
       session.xpEarned = newTotalXpEarned;
       await Hive.box<Sessions>('sessions').put(sessionKey, session);
       
       setState(() {});
+
+      await _adjustCurrency(xpDifference);
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -354,7 +448,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
         );
       }
 
-      // Sync the fixed flow_points to the cloud
       try {
         final supabase = Supabase.instance.client;
         await supabase.from('habit_sessions')
@@ -367,39 +460,78 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     }
   }
 
-  Future<bool?> _showInsuranceDialog() {
+  Future<bool?> _showInsuranceDialog(int missedDays, int currentCoins) {
     return showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
+        backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-        title: const Text(
-          "Streak at Risk!",
-          style: TextStyle(fontWeight: FontWeight.bold),
+        title: Row(
+          children: [
+            Icon(Icons.local_fire_department_rounded, color: Colors.orange.shade500),
+            const SizedBox(width: 8),
+            const Text(
+              "Streak at Risk!",
+              style: TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ],
         ),
-        content: const Text(
-          "You missed yesterday.\nUse 1 ClockCoin to save your streak?",
-          style: TextStyle(height: 1.4),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              "You missed $missedDays ${missedDays == 1 ? 'day' : 'days'}.",
+              style: const TextStyle(fontSize: 16, color: Colors.black87, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              "Would you like to spend $missedDays ClockCoins to recover your streak?",
+              style: TextStyle(height: 1.4, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade50,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.amber.shade200),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text("🪙", style: TextStyle(fontSize: 16)),
+                  const SizedBox(width: 6),
+                  Text(
+                    "Balance: $currentCoins",
+                    style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amber.shade900),
+                  ),
+                ],
+              ),
+            )
+          ],
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
             child: Text(
-              "No thanks",
-              style: TextStyle(color: Colors.grey.shade600),
+              "Let it die",
+              style: TextStyle(color: Colors.grey.shade500, fontWeight: FontWeight.bold),
             ),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.amber.shade600,
+              backgroundColor: Colors.amber.shade500,
               foregroundColor: Colors.white,
+              elevation: 0,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
               ),
             ),
             onPressed: () => Navigator.pop(context, true),
-            child: const Text(
-              "Use Coin",
-              style: TextStyle(fontWeight: FontWeight.bold),
+            child: Text(
+              "Pay $missedDays ${missedDays == 1 ? 'Coin' : 'Coins'}",
+              style: const TextStyle(fontWeight: FontWeight.w900),
             ),
           ),
         ],
@@ -407,7 +539,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     );
   }
 
-// 🔥 UPGRADED: Short, Punchy Archive Dialog
   Future<void> _archiveHabit() async {
     bool? confirm = await showDialog<bool>(
       context: context,
@@ -437,7 +568,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
             ),
             const SizedBox(height: 20),
             
-            // TL;DR Bullet Points
             _buildDialogBullet("Removes habit from daily list"),
             _buildDialogBullet("Safely stores all earned XP"),
             _buildDialogBullet("Locks in your peak streak"),
@@ -474,11 +604,9 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     );
 
     if (confirm == true) {
-      // 1. Update Local Hive Model
       widget.habit.isArchived = true;
       await widget.habit.save();
 
-      // 2. Sync to Supabase
       try {
         final supabase = Supabase.instance.client;
         await supabase
@@ -510,7 +638,7 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
             margin: const EdgeInsets.all(20),
           ),
         );
-        Navigator.pop(context); // Send them safely back to the home screen
+        Navigator.pop(context); 
       }
     }
   }
@@ -591,12 +719,11 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
       final groupService = GroupService();
       final allGroups = await groupService.getUserGroups(userId);
 
-      // 🔥 THE FIX: Route XP ONLY to the groups this habit is explicitly linked to!
       final linkedGroups = allGroups.where(
         (g) => widget.habit.linkedGroupIds.contains(g['group_id'])
       ).toList();
       
-      if (linkedGroups.isEmpty) return; // Halt if not shared with any groups
+      if (linkedGroups.isEmpty) return; 
 
       final actorName = await groupService.getMyDisplayName(userId);
 
@@ -750,11 +877,10 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
                 ),
                 const SizedBox(height: 16),
                 _buildConsistencyTimeline(),
-                const SizedBox(height: 32),// 🔥 NEW: Recent Logs Section (Edit / Undo logic)
+                const SizedBox(height: 32),
                 _buildRecentLogsSection(),
                 const SizedBox(height: 32),
 
-                // 🔥 NEW: Manage Linked Groups Button
                 SizedBox(
                   width: double.infinity,
                   height: 64,
@@ -790,7 +916,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
                 ),
                 const SizedBox(height: 16),
 
-                // 🔥 NEW: Mark as Completed / Archive Button
                 SizedBox(
                   width: double.infinity,
                   height: 64,
@@ -830,12 +955,10 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     );
   }
 
-  // 🔥 NEW: The Recent Logs UI
   Widget _buildRecentLogsSection() {
     return ValueListenableBuilder(
       valueListenable: Hive.box<Sessions>('sessions').listenable(),
       builder: (context, Box<Sessions> box, _) {
-        // Get sessions for this habit, sorted newest first
         final List<MapEntry<dynamic, Sessions>> recentSessions = box.toMap().entries
             .where((entry) => entry.value.habitId == widget.habit.id)
             .toList()
@@ -843,7 +966,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
 
         if (recentSessions.isEmpty) return const SizedBox.shrink();
 
-        // Show max 5 recent logs to prevent overwhelming UI
         final displaySessions = recentSessions.take(5).toList();
 
         return Column(
@@ -892,7 +1014,7 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
                          const SizedBox(width: 8),
                         IconButton(
                           icon: Icon(Icons.edit_rounded, color: Colors.indigo.shade300, size: 20),
-                          constraints: const BoxConstraints(), // Makes the button smaller
+                          constraints: const BoxConstraints(), 
                           padding: const EdgeInsets.all(4),
                           onPressed: () => _editSessionLog(entry.key, session),
                         ),
@@ -1300,7 +1422,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
                   child: TextField(
                     controller: _valueController,
                     focusNode: _valueFocus,
-                    // 🔥 THE FIX: Prevent entering massive numbers that break UI/Math
                     inputFormatters: [
                       LengthLimitingTextInputFormatter(7),
                       FilteringTextInputFormatter.allow(RegExp(r'^\d+\.?\d{0,2}')),
@@ -1615,8 +1736,6 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
     );
   }
 
-  
-
   void _showEditHabitDialog() {
     final titleController = TextEditingController(text: widget.habit.title);
     final targetController = TextEditingController(
@@ -1743,8 +1862,8 @@ class _HabitDetailScreenState extends State<HabitDetailScreen> {
                                 IconData icon = type == HabitType.duration
                                     ? Icons.timer_rounded
                                     : (type == HabitType.count
-                                          ? Icons.repeat_rounded
-                                          : Icons.water_drop_rounded);
+                                        ? Icons.repeat_rounded
+                                        : Icons.water_drop_rounded);
                                 return Expanded(
                                   child: GestureDetector(
                                     onTap: () => setDialogState(
@@ -2257,7 +2376,6 @@ class _ManageGroupsSheetState extends State<_ManageGroupsSheet> {
   @override
   void initState() {
     super.initState();
-    // Load the currently linked groups directly from the habit
     _selectedGroupIds = List.from(widget.habit.linkedGroupIds);
     _fetchMyGroups();
   }
@@ -2299,25 +2417,20 @@ class _ManageGroupsSheetState extends State<_ManageGroupsSheet> {
   Future<void> _saveLinks() async {
     setState(() => _isLoading = true);
 
-    // 🔥 THE FIX: Force everything to Strings so Dart's .contains() works perfectly
     final oldLinks = widget.habit.linkedGroupIds.map((e) => e.toString()).toList();
     final newLinks = _selectedGroupIds.map((e) => e.toString()).toList();
 
-    // Find exactly which groups were removed
     final unlinkedGroups = oldLinks.where((id) => !newLinks.contains(id)).toList();
     
-    // 1. Update Local Hive Model
     widget.habit.linkedGroupIds = newLinks;
     await widget.habit.save();
 
-    // 2. Update Cloud (Supabase)
     try {
       await Supabase.instance.client
           .from('habits')
           .update({'linked_group_ids': newLinks})
           .eq('id', widget.habit.id);
 
-      // 3. Wipe the visual receipts!
       for (String groupId in unlinkedGroups) {
         debugPrint("Attempting to delete activity for Group: $groupId and Habit: ${widget.habit.id}");
         

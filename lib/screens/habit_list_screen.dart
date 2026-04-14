@@ -33,14 +33,12 @@ class _HabitListScreenState extends State<HabitListScreen> {
     );
   }
 
-  // 🔥 NEW: Syncs a freshly created habit directly to Supabase
   Future<void> _syncNewHabitToCloudInBackground(Habit habit) async {
     final supabase = Supabase.instance.client;
     final userId = supabase.auth.currentUser?.id;
     if (userId == null) return;
 
     try {
-      // 1. Insert the base Habit
       await supabase.from('habits').insert({
         'id': habit.id,
         'user_id': userId,
@@ -53,8 +51,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
         'linked_group_ids': habit.linkedGroupIds,
       });
 
-      // 2. Initialize a blank Streak row for this habit
-      // This prevents the detail screen from having to "guess" if a streak exists later
       await supabase.from('streaks').insert({
         'habit_id': habit.id,
         'user_id': userId,
@@ -65,6 +61,49 @@ class _HabitListScreenState extends State<HabitListScreen> {
       debugPrint("✅ New habit & streak initialized in cloud.");
     } catch (e) {
       debugPrint("❌ Failed to sync new habit to cloud: $e");
+    }
+  }
+
+  // ==========================================
+  // 🔥 NEW: Adjust Wallet on Delete
+  // ==========================================
+  Future<void> _adjustCurrency(int xpDelta) async {
+    if (xpDelta == 0) return;
+
+    final supabase = Supabase.instance.client;
+    final userId = supabase.auth.currentUser?.id;
+    if (userId == null) return;
+
+    try {
+      final currencyData = await supabase
+          .from('currencies')
+          .select('clockcoins, loose_xp')
+          .eq('user_id', userId)
+          .maybeSingle();
+
+      int currentCoins = currencyData?['clockcoins'] as int? ?? 0;
+      int currentLoose = currencyData?['loose_xp'] as int? ?? 0;
+
+      int currentNetWorth = (currentCoins * 1000) + currentLoose;
+      int newNetWorth = max(0, currentNetWorth + xpDelta);
+
+      int newCoins = newNetWorth ~/ 1000;
+      int newLoose = newNetWorth % 1000;
+
+      await supabase
+          .from('currencies')
+          .update({
+            'clockcoins': newCoins,
+            'loose_xp': newLoose,
+            'last_updated': DateTime.now().toUtc().toIso8601String(),
+          })
+          .eq('user_id', userId);
+
+      debugPrint(
+        "💸 Economy Adjusted on Delete: $xpDelta XP. New Balance: $newCoins Coins.",
+      );
+    } catch (e) {
+      debugPrint("❌ Failed to adjust currency on delete: $e");
     }
   }
 
@@ -96,7 +135,7 @@ class _HabitListScreenState extends State<HabitListScreen> {
           ],
         ),
         content: Text(
-          "Are you sure you want to delete '${habit.title}'? This will permanently remove its streak and history.",
+          "Are you sure you want to delete '${habit.title}'? This will permanently remove its streak, history, and deduct ${habit.totalXP} XP from your total balance.",
           style: TextStyle(color: Colors.grey.shade700, height: 1.4),
         ),
         actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
@@ -120,12 +159,29 @@ class _HabitListScreenState extends State<HabitListScreen> {
                 borderRadius: BorderRadius.circular(12),
               ),
             ),
-            onPressed: () {
-              // 1. Instant Local Delete
-              _habitService.deleteHabit(habit.id);
-              Navigator.pop(context);
+            // 🔥 Make this onPressed async
+            onPressed: () async {
+              int xpToDeduct = habit.totalXP;
 
-              // 2. Background Cloud Delete (Fire and forget)
+              // 1. Instant Local Delete of the Habit
+              _habitService.deleteHabit(habit.id);
+
+              // 🔥 THE FIX: Wipe all orphaned local sessions for this habit!
+              final sessionBox = Hive.box<Sessions>('sessions');
+              final orphanedKeys = sessionBox
+                  .toMap()
+                  .entries
+                  .where((entry) => entry.value.habitId == habit.id)
+                  .map((entry) => entry.key)
+                  .toList();
+              await sessionBox.deleteAll(orphanedKeys);
+
+              if (mounted) Navigator.pop(context);
+
+              // 2. Securely deduct XP from the global economy
+              _adjustCurrency(-xpToDeduct);
+
+              // 3. Background Cloud Delete
               _deleteFromCloudInBackground(habit.id);
             },
             child: const Text("Delete"),
@@ -135,7 +191,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
     );
   }
 
-  // Handles safe deletion from Supabase in the background
   Future<void> _deleteFromCloudInBackground(String habitId) async {
     final supabase = Supabase.instance.client;
     final userId = supabase.auth.currentUser?.id;
@@ -143,14 +198,17 @@ class _HabitListScreenState extends State<HabitListScreen> {
     if (userId == null) return;
 
     try {
-      // 1. Delete child records first to prevent Foreign Key constraint errors
+      // 1. Delete child records first to prevent Foreign Key constraints
       await supabase.from('habit_sessions').delete().eq('habit_id', habitId);
       await supabase.from('streaks').delete().eq('habit_id', habitId);
+
+      // 🔥 NEW: Also wipe any group activity tied to this habit
+      await supabase.from('group_activity').delete().eq('habit_id', habitId);
 
       // 2. Delete the parent habit
       await supabase.from('habits').delete().eq('id', habitId);
 
-      debugPrint("✅ Habit permanently deleted from cloud.");
+      debugPrint("✅ Habit and related data permanently deleted from cloud.");
     } catch (e) {
       debugPrint("❌ Failed to delete habit from cloud: $e");
     }
@@ -159,42 +217,35 @@ class _HabitListScreenState extends State<HabitListScreen> {
   @override
   Widget build(BuildContext context) {
     final box = Hive.box<Habit>('habits');
-    final settingsBox = Hive.box(
-      'settings',
-    ); // 🔥 Get settings for custom ordering
+    final settingsBox = Hive.box('settings');
 
     return Scaffold(
       backgroundColor: Colors.grey.shade50,
       body: ValueListenableBuilder(
         valueListenable: box.listenable(),
         builder: (context, Box<Habit> box, _) {
-          // 🔥 1. Get the custom saved order of habit IDs
           List<dynamic> savedOrder = settingsBox.get(
             'habit_order',
             defaultValue: [],
           );
 
-          // 🔥 2. Filter out mastered habits
           final activeHabits = box.values
               .where((habit) => habit.isArchived == false)
               .toList();
 
-          // 🔥 3. Sort them exactly how the user arranged them!
           activeHabits.sort((a, b) {
             int indexA = savedOrder.indexOf(a.id);
             int indexB = savedOrder.indexOf(b.id);
-            if (indexA == -1) indexA = 999999; // New items go to the bottom
+            if (indexA == -1) indexA = 999999;
             if (indexB == -1) indexB = 999999;
             return indexA.compareTo(indexB);
           });
 
-          // 🔥 4. THE FIX: Sum ALL XP globally, including archived habits!
           int totalXP = box.values.fold(0, (sum, h) => sum + h.totalXP);
 
           final sessionBox = Hive.box<Sessions>('sessions');
           final sessions = sessionBox.values.toList();
 
-          // Calculate Weekly XP for Chart
           Map<String, int> weeklyXP = {};
           for (int i = 6; i >= 0; i--) {
             final day = DateTime.now().subtract(Duration(days: i));
@@ -209,7 +260,7 @@ class _HabitListScreenState extends State<HabitListScreen> {
               weeklyXP[key] = weeklyXP[key]! + session.xpEarned;
             }
           }
-          // Level Math
+
           int level = (sqrt(totalXP / 80)).floor() + 1;
           int currentLevelBaseXP = pow(level - 1, 2).toInt() * 80;
           int nextLevelXP = pow(level, 2).toInt() * 80;
@@ -217,7 +268,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
           int xpIntoCurrentLevel = totalXP - currentLevelBaseXP;
           int xpNeededForNextLevel = nextLevelXP - currentLevelBaseXP;
 
-          // 🔥 Calculate progress strictly within the current level's bounds
           double currentLevelProgress = xpNeededForNextLevel == 0
               ? 0
               : xpIntoCurrentLevel / xpNeededForNextLevel;
@@ -231,7 +281,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
               SliverToBoxAdapter(
                 child: Column(
                   children: [
-                    // 🔥 REIMAGINED Premium Dashboard Header (No Cramming!)
                     Container(
                       margin: const EdgeInsets.fromLTRB(16, 56, 16, 8),
                       padding: const EdgeInsets.all(24),
@@ -344,7 +393,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                       ),
                     ),
 
-                    // 🔥 Reimagined Activity Chart (Overflow FIXED!)
                     Container(
                       margin: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -399,16 +447,14 @@ class _HabitListScreenState extends State<HabitListScreen> {
                           ),
                           const SizedBox(height: 24),
 
-                          // Dynamic scaling for bars
                           Builder(
                             builder: (context) {
                               int maxXP = weeklyXP.values.isEmpty
                                   ? 1
                                   : weeklyXP.values.reduce(max);
                               if (maxXP == 0) {
-                                maxXP = 1; // Prevent division by zero
+                                maxXP = 1;
                               }
-                              // 🔥 Removed rigid height box to dynamically adapt to system font scaling
                               return Row(
                                 mainAxisAlignment:
                                     MainAxisAlignment.spaceBetween,
@@ -418,7 +464,7 @@ class _HabitListScreenState extends State<HabitListScreen> {
                                   double fillPercentage = xp / maxXP;
                                   double barHeight = fillPercentage * 90;
                                   if (xp > 0 && barHeight < 8) {
-                                    barHeight = 8; // Min visibility if > 0
+                                    barHeight = 8;
                                   }
 
                                   final dateParts = entry.key.split("-");
@@ -440,11 +486,9 @@ class _HabitListScreenState extends State<HabitListScreen> {
                                   return Expanded(
                                     child: Column(
                                       mainAxisAlignment: MainAxisAlignment.end,
-                                      mainAxisSize: MainAxisSize
-                                          .min, // 🔥 Ensures the column shrink-wraps height
+                                      mainAxisSize: MainAxisSize.min,
                                       children: [
                                         FittedBox(
-                                          // 🔥 Shrinks large XP numbers so they don't break layout
                                           fit: BoxFit.scaleDown,
                                           child: Text(
                                             xp > 0 ? "$xp" : "",
@@ -513,7 +557,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                         ],
                       ),
                     ),
-                    // Running Habit Highlight
                     if (runningHabit != null)
                       Container(
                         margin: const EdgeInsets.symmetric(
@@ -599,7 +642,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                 ),
               ),
 
-              // 🔥 THE DRAGGABLE HABIT LIST
               if (activeHabits.isEmpty)
                 SliverFillRemaining(
                   child: Center(
@@ -638,19 +680,13 @@ class _HabitListScreenState extends State<HabitListScreen> {
                     top: 8,
                     bottom: 100,
                   ),
-                  // 🔥 Swapped SliverList for SliverReorderableList
-                  // 🔥 Swapped SliverList for SliverReorderableList
                   sliver: SliverReorderableList(
                     itemCount: activeHabits.length,
                     itemBuilder: (context, index) {
                       final habit = activeHabits[index];
-                      // Reorderable lists MUST have a unique key per item!
                       return Container(
                         key: ValueKey(habit.id),
-                        child: _buildHabitCard(
-                          habit,
-                          index,
-                        ), // 🔥 Pass the index here!
+                        child: _buildHabitCard(habit, index),
                       );
                     },
                     onReorder: (int oldIndex, int newIndex) {
@@ -661,7 +697,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                         final habit = activeHabits.removeAt(oldIndex);
                         activeHabits.insert(newIndex, habit);
 
-                        // Save the new array of IDs to local storage instantly!
                         settingsBox.put(
                           'habit_order',
                           activeHabits.map((h) => h.id).toList(),
@@ -726,7 +761,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
         ],
         border: Border.all(color: Colors.grey.shade100),
       ),
-      // 🔥 ClipRRect keeps the fluid background strictly inside the rounded card
       child: ClipRRect(
         borderRadius: BorderRadius.circular(20),
         child: ValueListenableBuilder(
@@ -758,7 +792,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
 
             return Stack(
               children: [
-                // 🔥 THE FLUID BACKGROUND PROGRESS BAR 🔥
                 Positioned.fill(
                   child: FractionallySizedBox(
                     alignment: Alignment.centerLeft,
@@ -783,7 +816,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                   ),
                 ),
 
-                // Foreground Content
                 Material(
                   color: Colors.transparent,
                   child: InkWell(
@@ -800,7 +832,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                       padding: const EdgeInsets.all(16),
                       child: Row(
                         children: [
-                          // Standard Icon Container
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
@@ -821,7 +852,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                           ),
                           const SizedBox(width: 16),
 
-                          // Text & Stats
                           Expanded(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -867,7 +897,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                                       ),
                                     ),
 
-                                    // 🔥 NEW: The Linked Groups Badge
                                     if (habit.linkedGroupIds.isNotEmpty) ...[
                                       const SizedBox(width: 12),
                                       Container(
@@ -910,7 +939,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                             ),
                           ),
 
-                          // 🔥 THE DYNAMIC PROGRESS PILL 🔥
                           Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 10,
@@ -957,7 +985,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
                             ),
                           ),
 
-                          // Compact Actions
                           const SizedBox(width: 4),
                           IconButton(
                             icon: Icon(
@@ -997,277 +1024,6 @@ class _HabitListScreenState extends State<HabitListScreen> {
       ),
     );
   }
-
-  // Widget _buildHabitCard(Habit habit, int index) {
-  //   String scheduleLabel() {
-  //     if (habit.frequency == HabitFrequency.daily) return "Daily";
-  //     if (habit.frequency == HabitFrequency.weekly) return "Weekly";
-  //     if (habit.frequency == HabitFrequency.custom &&
-  //         habit.customDays != null) {
-  //       final labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  //       return habit.customDays!.map((d) => labels[d - 1]).join(', ');
-  //     }
-  //     return "";
-  //   }
-
-  //   IconData getIconForType() {
-  //     switch (habit.type) {
-  //       case HabitType.duration:
-  //         return Icons.timer_rounded;
-  //       case HabitType.count:
-  //         return Icons.repeat_rounded;
-  //       case HabitType.quantity:
-  //         return Icons.water_drop_rounded;
-  //     }
-  //   }
-
-  //   return Container(
-  //     margin: const EdgeInsets.only(bottom: 12),
-  //     decoration: BoxDecoration(
-  //       color: Colors.white,
-  //       borderRadius: BorderRadius.circular(20),
-  //       boxShadow: [
-  //         BoxShadow(
-  //           color: Colors.black.withValues(alpha: 0.03),
-  //           blurRadius: 8,
-  //           offset: const Offset(0, 4),
-  //         ),
-  //       ],
-  //       border: Border.all(color: Colors.grey.shade100),
-  //     ),
-  //     // 🔥 ClipRRect keeps the fluid background strictly inside the rounded card
-  //     child: ClipRRect(
-  //       borderRadius: BorderRadius.circular(20),
-  //       child: ValueListenableBuilder(
-  //         valueListenable: Hive.box<Sessions>('sessions').listenable(),
-  //         builder: (context, Box<Sessions> sessionBox, _) {
-  //           final today = DateTime.now();
-  //           double todayTotal = 0;
-
-  //           for (var s in sessionBox.values) {
-  //             if (s.habitId == habit.id &&
-  //                 s.date.year == today.year &&
-  //                 s.date.month == today.month &&
-  //                 s.date.day == today.day) {
-  //               todayTotal += s.value;
-  //             }
-  //           }
-
-  //           double progress = habit.dailyTarget > 0
-  //               ? todayTotal / habit.dailyTarget
-  //               : 0;
-  //           bool isCompleted = progress >= 1.0;
-
-  //           String formattedTotal = todayTotal.toStringAsFixed(
-  //             todayTotal.truncateToDouble() == todayTotal ? 0 : 1,
-  //           );
-  //           String formattedTarget = habit.dailyTarget.toStringAsFixed(
-  //             habit.dailyTarget.truncateToDouble() == habit.dailyTarget ? 0 : 1,
-  //           );
-
-  //           return Stack(
-  //             children: [
-  //               // 🔥 THE FLUID BACKGROUND PROGRESS BAR 🔥
-  //               Positioned.fill(
-  //                 child: FractionallySizedBox(
-  //                   alignment: Alignment.centerLeft,
-  //                   widthFactor: progress.clamp(0.0, 1.0),
-  //                   child: AnimatedContainer(
-  //                     duration: const Duration(milliseconds: 600),
-  //                     curve: Curves.easeOutCubic,
-  //                     decoration: BoxDecoration(
-  //                       gradient: LinearGradient(
-  //                         colors: isCompleted
-  //                             ? [
-  //                                 Colors.green.shade50,
-  //                                 Colors.green.shade100.withValues(alpha: 0.5),
-  //                               ]
-  //                             : [
-  //                                 Colors.indigo.shade50.withValues(alpha: 0.5),
-  //                                 Colors.indigo.shade50,
-  //                               ],
-  //                       ),
-  //                     ),
-  //                   ),
-  //                 ),
-  //               ),
-
-  //               // Foreground Content
-  //               Material(
-  //                 color: Colors.transparent,
-  //                 child: InkWell(
-  //                   borderRadius: BorderRadius.circular(20),
-  //                   onTap: () {
-  //                     Navigator.push(
-  //                       context,
-  //                       MaterialPageRoute(
-  //                         builder: (_) => HabitDetailScreen(habit: habit),
-  //                       ),
-  //                     );
-  //                   },
-  //                   child: Padding(
-  //                     padding: const EdgeInsets.all(16),
-  //                     child: Row(
-  //                       children: [
-  //                         // Standard Icon Container
-  //                         Container(
-  //                           padding: const EdgeInsets.all(12),
-  //                           decoration: BoxDecoration(
-  //                             color: isCompleted
-  //                                 ? Colors.green.withValues(alpha: 0.1)
-  //                                 : Colors.indigo.withValues(alpha: 0.08),
-  //                             borderRadius: BorderRadius.circular(14),
-  //                           ),
-  //                           child: Icon(
-  //                             isCompleted
-  //                                 ? Icons.check_circle_rounded
-  //                                 : getIconForType(),
-  //                             color: isCompleted
-  //                                 ? Colors.green.shade600
-  //                                 : Colors.indigo.shade500,
-  //                             size: 24,
-  //                           ),
-  //                         ),
-  //                         const SizedBox(width: 16),
-
-  //                         // Text & Stats
-  //                         Expanded(
-  //                           child: Column(
-  //                             crossAxisAlignment: CrossAxisAlignment.start,
-  //                             children: [
-  //                               Text(
-  //                                 habit.title,
-  //                                 style: const TextStyle(
-  //                                   fontWeight: FontWeight.w800,
-  //                                   fontSize: 16,
-  //                                   color: Colors.black87,
-  //                                 ),
-  //                               ),
-  //                               const SizedBox(height: 6),
-  //                               Row(
-  //                                 children: [
-  //                                   Icon(
-  //                                     Icons.local_fire_department_rounded,
-  //                                     size: 14,
-  //                                     color: Colors.orange.shade500,
-  //                                   ),
-  //                                   const SizedBox(width: 4),
-  //                                   Text(
-  //                                     "${habit.streak}",
-  //                                     style: TextStyle(
-  //                                       fontWeight: FontWeight.bold,
-  //                                       fontSize: 12,
-  //                                       color: Colors.grey.shade700,
-  //                                     ),
-  //                                   ),
-  //                                   const SizedBox(width: 12),
-  //                                   Icon(
-  //                                     Icons.star_rounded,
-  //                                     size: 14,
-  //                                     color: Colors.amber.shade500,
-  //                                   ),
-  //                                   const SizedBox(width: 4),
-  //                                   Text(
-  //                                     "${habit.totalXP}",
-  //                                     style: TextStyle(
-  //                                       fontWeight: FontWeight.bold,
-  //                                       fontSize: 12,
-  //                                       color: Colors.grey.shade700,
-  //                                     ),
-  //                                   ),
-  //                                 ],
-  //                               ),
-  //                             ],
-  //                           ),
-  //                         ),
-
-  //                         // 🔥 THE DYNAMIC PROGRESS PILL 🔥
-  //                         Container(
-  //                           padding: const EdgeInsets.symmetric(
-  //                             horizontal: 10,
-  //                             vertical: 6,
-  //                           ),
-  //                           decoration: BoxDecoration(
-  //                             color: Colors.white.withValues(alpha: 0.8),
-  //                             borderRadius: BorderRadius.circular(12),
-  //                             border: Border.all(
-  //                               color: isCompleted
-  //                                   ? Colors.green.shade200
-  //                                   : Colors.indigo.shade100,
-  //                             ),
-  //                           ),
-  //                           child: Row(
-  //                             mainAxisSize: MainAxisSize.min,
-  //                             children: [
-  //                               if (!isCompleted) ...[
-  //                                 SizedBox(
-  //                                   width: 12,
-  //                                   height: 12,
-  //                                   child: CircularProgressIndicator(
-  //                                     value: progress,
-  //                                     strokeWidth: 2.5,
-  //                                     backgroundColor: Colors.grey.shade200,
-  //                                     color: Colors.indigo.shade400,
-  //                                   ),
-  //                                 ),
-  //                                 const SizedBox(width: 6),
-  //                               ],
-  //                               Text(
-  //                                 isCompleted
-  //                                     ? "DONE"
-  //                                     : "$formattedTotal / $formattedTarget",
-  //                                 style: TextStyle(
-  //                                   fontSize: 11,
-  //                                   fontWeight: FontWeight.w900,
-  //                                   color: isCompleted
-  //                                       ? Colors.green.shade700
-  //                                       : Colors.indigo.shade600,
-  //                                 ),
-  //                               ),
-  //                             ],
-  //                           ),
-  //                         ),
-
-  //                         // Compact Actions
-  //                         const SizedBox(width: 4),
-  //                         IconButton(
-  //                           icon: Icon(
-  //                             Icons.delete_outline,
-  //                             color: Colors.red.shade300,
-  //                             size: 20,
-  //                           ),
-  //                           constraints: const BoxConstraints(),
-  //                           padding: const EdgeInsets.all(8),
-  //                           onPressed: () => _confirmDelete(habit),
-  //                         ),
-  //                         ReorderableDragStartListener(
-  //                           index: index,
-  //                           child: Padding(
-  //                             padding: const EdgeInsets.only(
-  //                               left: 4,
-  //                               right: 4,
-  //                               top: 12,
-  //                               bottom: 12,
-  //                             ),
-  //                             child: Icon(
-  //                               Icons.drag_handle_rounded,
-  //                               color: Colors.grey.shade400,
-  //                               size: 20,
-  //                             ),
-  //                           ),
-  //                         ),
-  //                       ],
-  //                     ),
-  //                   ),
-  //                 ),
-  //               ),
-  //             ],
-  //           );
-  //         },
-  //       ),
-  //     ),
-  //   );
-  // }
 }
 
 // ==========================================
@@ -1296,7 +1052,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
   List<bool> selectedWeekdays = List.generate(7, (_) => false);
   String activeTemplate = "Custom";
 
-  // 🔥 NEW: Difficulty Meter (0=Easy, 1=Medium, 2=Hard)
   int _difficulty = 1;
 
   bool _isLoadingGroups = true;
@@ -1309,7 +1064,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
     _fetchMyGroups();
   }
 
-  // 🔥 NEW: Fetch groups the user belongs to
   Future<void> _fetchMyGroups() async {
     final supabase = Supabase.instance.client;
     final userId = supabase.auth.currentUser?.id;
@@ -1320,7 +1074,7 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
           .from('group_members')
           .select('group_id, groups(name)')
           .eq('user_id', userId)
-          .eq('status', 'active'); // Only fetch groups they are fully in
+          .eq('status', 'active');
 
       final List<Map<String, dynamic>> groups = [];
       for (var row in response) {
@@ -1402,7 +1156,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
       ),
       child: Column(
         children: [
-          // Drag Handle & Title
           Container(
             padding: const EdgeInsets.symmetric(vertical: 16),
             decoration: BoxDecoration(
@@ -1431,7 +1184,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
             ),
           ),
 
-          // Scrollable Form Content
           Expanded(
             child: SingleChildScrollView(
               padding: EdgeInsets.only(
@@ -1682,7 +1434,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
                     ),
                     const SizedBox(height: 24),
 
-                    // 🔥 NEW: Difficulty Meter
                     const Text(
                       "Difficulty Level",
                       style: TextStyle(
@@ -1716,7 +1467,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
                     Padding(
                       padding: const EdgeInsets.only(top: 8, left: 4),
                       child: Text(
-                        // 🔥 UPDATED TEXT: Shows total pool instead of per-unit
                         "Rewards: Up to ${_difficulty == 0 ? '50' : (_difficulty == 1 ? '100' : '150')} XP for hitting your daily target",
                         style: TextStyle(
                           fontSize: 12,
@@ -1728,7 +1478,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
 
                     const SizedBox(height: 24),
 
-                    // 🔥 NEW: Group Linking UI
                     if (_myGroups.isNotEmpty) ...[
                       const Text(
                         "Link to Groups",
@@ -1853,7 +1602,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
             ),
           ),
 
-          // Fixed Bottom Action Button
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
@@ -1892,10 +1640,8 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
 
                     double target = double.tryParse(targetController.text) ?? 1;
 
-                    // 🔥 INCREASED CLAMP: Allow up to 100,000 for things like steps
                     target = target.clamp(1, 100000);
 
-                    // 🔥 THE MATH FIX: Calculate XP dynamically based on the total pool
                     double targetXpPool = _difficulty == 0
                         ? 50.0
                         : (_difficulty == 1 ? 100.0 : 150.0);
@@ -1927,8 +1673,7 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
                       type: selectedType,
                       unit: unitController.text,
                       dailyTarget: target,
-                      xpPerUnit:
-                          calculatedXpPerUnit, // 🔥 Pass the calculated fraction here!
+                      xpPerUnit: calculatedXpPerUnit,
                       frequency: selectedFrequency,
                       customDays: selectedCustomDays.isEmpty
                           ? null
@@ -1952,7 +1697,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
     );
   }
 
-  // Helper for input fields
   Widget _buildInputField({
     required TextEditingController controller,
     required String label,
@@ -1986,7 +1730,6 @@ class _HabitTemplateSheetState extends State<_HabitTemplateSheet> {
     );
   }
 
-  // Helper for Difficulty Options
   Widget _buildDifficultyOption(
     int index,
     String label,
